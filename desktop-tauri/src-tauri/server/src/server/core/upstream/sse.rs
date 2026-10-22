@@ -123,6 +123,46 @@ impl FramePolicy {
     }
 }
 
+/// 空壳 `delta.function_call` 的清洗判据。
+///
+/// ── 上游为什么会发这个 ────────────────────────────────────
+/// `copilot.tencent.com`（WorkBuddy）在**每一帧**都带齐 `function_call` /
+/// `tool_calls` / `extra_fields` 三个键。前者普通帧是 `null`，而**终止帧**
+/// （`finish_reason:"stop"` 那一帧）是 `{"name":"","arguments":""}` ——
+/// 一个两个字段都为空的对象。本轮实测于 `deepseek-v4.1-flash`：正常
+/// 文本回复、`tool_calls` 自始至终为 `[]`，模型并没有调用任何工具。
+///
+/// ── 为什么必须清掉 ──────────────────────────────────────
+/// 「对象存在」与「真的在调工具」是两件事。宽容的客户端按
+/// `delta.function_call?.name` 判（空串假值 → 当没有调用），Operit 就是如此；
+/// 严格的客户端按 `if (delta.function_call)` 判（对象为真 → 当有调用），
+/// 接着读 `name` 得到空串，就报「响应缺少工具名称」并把整轮判为非法。
+/// 同一个字节流让两边表现不同，差异只在空壳这一处 —— 而空壳**不携带任何
+/// 语义**（名字空、参数空），清掉不会改变任何客户端能读懂的东西。
+///
+/// 与 [`is_newline_keepalive`] 同属「上游噪声」，但判据独立：那个丢的是
+/// **整帧**（只有换行的节拍），这里改的是**帧里的一个成员**，两者互不干涉。
+///
+/// 判据刻意做成**只认全空**：`name` 或 `arguments` 任何一个非空就不动 ——
+/// 有内容的 `function_call` 可能真是上游在走遗留的 FC 协议，改写它会
+/// 制造出「代理看到的内容与上游发的不同」的真实差异（本仓拒绝的形态）。
+pub fn is_empty_function_call(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    // 任何未知成员都算「有内容」：只认识 name / arguments 两个键的上游才会
+    // 产出全空对象，多出来的键说明这不是我们实测过的那种空壳。
+    if object.keys().any(|key| key != "name" && key != "arguments") {
+        return false;
+    }
+    let blank = |key: &str| match object.get(key) {
+        None | Some(Value::Null) => true,
+        Some(Value::String(text)) => text.trim().is_empty(),
+        Some(_) => false,
+    };
+    blank("name") && blank("arguments")
+}
+
 /// 这一帧是不是「整片只有换行」的保活分片（判据全部是**宁可不丢**的方向）。
 ///
 /// 命中要同时满足下面每一条：
@@ -406,7 +446,58 @@ impl ReasoningCoalescer {
             out.push(self.coalesced_frame());
             self.acc.clear();
         }
-        out.push(self.rewritten_frame(line, &chunk));
+        // ── 空壳 function_call 的清洗（见 `is_empty_function_call`）──────
+        // 位置在「冲刷累积 reasoning」**之后**、`rewritten_frame` **之前**：
+        // 前者决定这一帧要不要下发，后者可能已经改写过 model；清洗要发生在
+        // 最终成帧这一步，才不会与那条回写互相覆盖。未命中时走原行字节。
+        if let Some(frame) = self.scrub_frame(&chunk) {
+            out.push(frame);
+        } else {
+            out.push(self.rewritten_frame(line, &chunk));
+        }
+    }
+
+    /// 清掉 delta 里的**空壳** `function_call`（见 [`is_empty_function_call`]）。
+    ///
+    /// 返回 `None` = 这一帧没有需要清洗的东西，调用方走**原行的字节**（透传
+    /// 逐字节不变，与未接入本钩子时完全一致）；`Some(frame)` = 已经重新
+    /// 序列化过的下发帧。
+    ///
+    /// ── 为什么用 `Option<Frame>` 而不是「总是重新序列化」──────────
+    /// 未命中时返回原行，才能守住本模块的硬要求：绝大多数帧的字节不受
+    /// 这个钩子影响。若统一走「解析 → 再序列化」，键顺序与空白都会变
+    /// （serde_json 未开 `preserve_order`），等于给每一帧都做了改写。
+    ///
+    /// 只动 `choices[].delta`，且只删 `function_call` 这一个成员：`tool_calls`
+    /// 的空数组照旧保留（客户端按长度判空，删键反而可能让它少一个默认值）。
+    fn scrub_frame(&self, chunk: &Value) -> Option<Frame> {
+        if !chunk.get("choices")?.as_array().is_some_and(|items| !items.is_empty()) {
+            return None;
+        }
+        let mut touched = false;
+        let mut next = chunk.clone();
+        for choice in next.get_mut("choices")?.as_array_mut()? {
+            let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let Some(call) = delta.get("function_call") else {
+                continue;
+            };
+            if is_empty_function_call(call) {
+                // 置为 null 而不是删键：上游本来就在普通帧里发 `null`，
+                // 对齐成同一个形态，客户端按「假值即无调用」判就一致了。
+                delta.insert("function_call".to_string(), Value::Null);
+                touched = true;
+            }
+        }
+        if !touched {
+            return None;
+        }
+        match serde_json::to_string(&next) {
+            Ok(text) => Some(Bytes::from(format!("data: {text}\n\n"))),
+            // 序列化失败宁可退回原行：少一次清洗好过下发一条拼坏的帧
+            Err(_) => None
+        }
     }
 
     /// 透传一帧，必要时把 `model` 改写成客户端请求的名字。
@@ -879,5 +970,103 @@ mod tests {
             feed(&mut coalescer, "data: [DONE]\n\n").trim() == "data: [DONE]",
             "acc 已清空，[DONE] 处不该再补一帧空的思考"
         );
+    }
+    // ── 空壳 function_call 清洗（2026-10 实测 WorkBuddy / deepseek-v4.1-flash）──
+    //
+    // 下面两条原文照抄生产抓包（`request_raw.response_body`，5160 字节里的
+    // 首尾两帧）。它们钉住的是「同一个字节流，宽容客户端与严格客户端必须
+    // 都读成『没有工具调用』」这件事。
+
+    /// 上游终止帧原样形态：`function_call` 是 `{"name":"","arguments":""}`。
+    const TERMINAL_WITH_EMPTY_FC: &str = concat!(
+        r#"data: {"id":"01a163b77d1e78cead7c224a588c4f50","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1792674332,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"","function_call":{"name":"","arguments":""},"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":"stop"}],"usage":null}"#,
+        "\n\n"
+    );
+
+    /// 同一份流里的普通正文帧：`function_call` 是 `null`。
+    const PLAIN_WITH_NULL_FC: &str = concat!(
+        r#"data: {"id":"01a163b77d1e78cead7c224a588c4f50","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1792674332,"choices":[{"index":0,"delta":{"content":"行","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":""}],"usage":null}"#,
+        "\n\n"
+    );
+
+    #[test]
+    fn empty_function_call_is_recognised() {
+        let blank = serde_json::json!({"name": "", "arguments": ""});
+        assert!(is_empty_function_call(&blank));
+        // 只有 name 缺省、arguments 缺省也算空壳（上游形态不稳定）
+        assert!(is_empty_function_call(&serde_json::json!({})));
+        assert!(is_empty_function_call(&serde_json::json!({"name": "  "})));
+        assert!(is_empty_function_call(&serde_json::json!({"name": null, "arguments": null})));
+    }
+
+    /// 有内容的 `function_call` 一律不许判成空壳 —— 那是真在调工具，
+    /// 改写它会制造「代理发的与上游给的不同」的真实差异。
+    #[test]
+    fn real_function_call_is_never_scrubbed() {
+        assert!(!is_empty_function_call(&serde_json::json!({
+            "name": "browser_use", "arguments": "{}"
+        })));
+        assert!(!is_empty_function_call(&serde_json::json!({
+            "name": "browser_use", "arguments": ""
+        })));
+        assert!(!is_empty_function_call(&serde_json::json!({
+            "name": "", "arguments": "{\"a\":1}"
+        })));
+        // 多出未知成员：判不出来源，按「有内容」处理
+        assert!(!is_empty_function_call(&serde_json::json!({
+            "name": "", "arguments": "", "extra": 1
+        })));
+        // 非对象（null / 字符串）不是空壳，交给透传
+        assert!(!is_empty_function_call(&Value::Null));
+        assert!(!is_empty_function_call(&serde_json::json!("x")));
+    }
+
+    /// 端到端：终止帧里的空壳必须变成 `null`，`tool_calls: []` 与其它成员保留。
+    #[test]
+    fn terminal_frame_gets_empty_function_call_scrubbed() {
+        let mut coalescer = ReasoningCoalescer::new();
+        let frames = coalescer.push(TERMINAL_WITH_EMPTY_FC.as_bytes());
+        assert_eq!(frames.len(), 1);
+        let text = std::str::from_utf8(&frames[0]).expect("utf8");
+        let body = text.trim().strip_prefix("data: ").expect("data prefix");
+        let chunk: Value = serde_json::from_str(body.trim()).expect("json");
+        let delta = &chunk["choices"][0]["delta"];
+        assert!(delta["function_call"].is_null(), "空壳必须被置为 null");
+        assert_eq!(delta["tool_calls"], serde_json::json!([]), "空数组照旧保留");
+        assert_eq!(chunk["choices"][0]["finish_reason"], "stop", "收尾标记不丢");
+        assert_eq!(chunk["id"], "01a163b77d1e78cead7c224a588c4f50", "id 不丢");
+    }
+
+    /// 未命中的帧必须**逐字节**不变（本模块的硬要求）。
+    #[test]
+    fn plain_frame_is_byte_identical() {
+        let mut coalescer = ReasoningCoalescer::new();
+        let frames = coalescer.push(PLAIN_WITH_NULL_FC.as_bytes());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].as_ref(),
+            PLAIN_WITH_NULL_FC.as_bytes(),
+            "function_call 已是 null 的帧不该被重新序列化"
+        );
+    }
+
+    /// 真·工具调用帧：`tool_calls` 非空、`function_call` 为空壳时，
+    /// 清洗只能动 function_call，`tool_calls` 里的名字与参数一个字节都不能少。
+    #[test]
+    fn tool_call_frame_keeps_its_name_and_arguments() {
+        let frame = concat!(
+            r#"data: {"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"","function_call":{"name":"","arguments":""},"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"browser_use","arguments":"{\"q\":1}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "\n\n"
+        );
+        let mut coalescer = ReasoningCoalescer::new();
+        let frames = coalescer.push(frame.as_bytes());
+        let text = std::str::from_utf8(&frames[0]).expect("utf8");
+        let body = text.trim().strip_prefix("data: ").expect("data prefix");
+        let chunk: Value = serde_json::from_str(body.trim()).expect("json");
+        let delta = &chunk["choices"][0]["delta"];
+        assert!(delta["function_call"].is_null());
+        assert_eq!(delta["tool_calls"][0]["function"]["name"], "browser_use");
+        assert_eq!(delta["tool_calls"][0]["function"]["arguments"], "{\"q\":1}");
+        assert_eq!(delta["tool_calls"][0]["id"], "call_1");
     }
 }
